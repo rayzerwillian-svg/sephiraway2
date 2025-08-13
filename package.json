@@ -1,0 +1,418 @@
+/*
+  SephiraWay / Lovable.dev — Cloudflare Pages + Functions + D1 (100% grátis)
+  - Frontend: Vite + React (build estático → Pages)
+  - Backend: Pages Functions (Workers) com streaming p/ ChatGPT
+  - Banco: Cloudflare D1 (SQLite) p/ sessões, mensagens e diretrizes (guidelines)
+
+  ⚠️ Deploy no Cloudflare Pages (sem erro de 'vite: not found')
+  1) Garanta que este repositório contém: package.json, vite.config.ts, functions/*, schema.sql, src/* e (opcional) wrangler.toml.
+  2) No Cloudflare Pages → Build settings:
+     - Build command: **npm run build**
+     - Output directory: **dist**
+  3) Project → Settings → Functions → D1 Databases: adicione binding **DB** apontando para seu D1.
+  4) Project → Settings → Environment variables: **OPENAI_API_KEY**.
+  5) (Local) Dev: `npx wrangler pages dev --d1=DB --binding OPENAI_API_KEY=sk-...`
+
+  Como usar (CLI resumido):
+  1) npm i
+  2) npx wrangler d1 create sephiraway-db → copie o database_id para wrangler.toml
+  3) npx wrangler d1 execute sephiraway-db --file=./schema.sql
+  4) npx wrangler pages dev --d1=DB --binding OPENAI_API_KEY=sk-...
+*/
+
+// package.json
+{
+  "name": "sephiraway-cf-pages",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler pages dev --d1=DB",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "vite": "^5.3.3",
+    "@types/react": "^18.2.73",
+    "@types/react-dom": "^18.2.22",
+    "wrangler": "^3.65.0"
+  }
+}
+
+// vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()], build: { outDir: 'dist' } });
+
+// wrangler.toml
+name = "sephiraway-pages"
+pages_build_output_dir = "dist"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sephiraway-db"
+database_id = "<preencha-o-id-depois-de-create>"
+
+// index.html
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SephiraWay | Diagnóstico Espiritual</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+// src/main.tsx
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+const root = createRoot(document.getElementById('root')!);
+root.render(<App />);
+
+// src/components/Questionnaire.tsx
+import React, { useState } from 'react';
+export type FormData = {
+  nome_completo: string;
+  data_nasc: string;
+  hora_nasc: string;
+  local_nasc: string;
+  ennea_raw: string;
+  intencao_12m: string;
+  push_ok: boolean;
+};
+export default function Questionnaire({ onSubmit }: { onSubmit: (d: FormData) => void }) {
+  const [f, setF] = useState<FormData>({
+    nome_completo: '', data_nasc: '', hora_nasc: '', local_nasc: '', ennea_raw: '', intencao_12m: '', push_ok: false
+  });
+  const ch = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+    const { name, value, type, checked } = e.target as HTMLInputElement;
+    setF(p => ({ ...p, [name]: type === 'checkbox' ? checked : value }));
+  };
+  return (
+    <form onSubmit={(e)=>{e.preventDefault(); onSubmit(f);}} className="q">
+      <input name="nome_completo" placeholder="Nome completo" onChange={ch} required />
+      <div className="row">
+        <input name="data_nasc" type="date" onChange={ch} required />
+        <input name="hora_nasc" type="time" onChange={ch} required />
+      </div>
+      <input name="local_nasc" placeholder="Cidade, Estado, País" onChange={ch} required />
+      <textarea name="ennea_raw" placeholder="Eneagrama (3 frases)" onChange={ch} required />
+      <input name="intencao_12m" placeholder="Intenção p/ 12 meses" onChange={ch} required />
+      <label className="ck"><input type="checkbox" name="push_ok" onChange={ch} />Quero receber lembretes diários</label>
+      <button type="submit">Gerar Diagnóstico</button>
+      <style>{`
+        .q{max-width:640px;margin:16px auto;padding:16px;border:1px solid #ccc;border-radius:12px;display:grid;gap:8px;background:#fff}
+        .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+        input,textarea{padding:10px;border-radius:8px;border:1px solid #ddd}
+        .ck{display:flex;align-items:center;gap:8px}
+        button{padding:12px 16px;border:0;border-radius:10px;background:#2dd4bf;color:#111;font-weight:700}
+      `}</style>
+    </form>
+  );
+}
+
+// src/App.tsx
+import React, { useMemo, useState, Suspense } from 'react';
+import Questionnaire, { FormData } from './components/Questionnaire';
+
+export default function App(){
+  const [phase, setPhase] = useState<'landing'|'form'|'summary'|'chat'>('landing');
+  const [formData, setFormData] = useState<any>(null);
+  const [diagnostico, setDiagnostico] = useState('');
+  const [mentorMessages, setMentorMessages] = useState<{role:'user'|'mentor';content:string}[]>([]);
+  const [inputMsg, setInputMsg] = useState('');
+  const [questionCount, setQuestionCount] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const sessionId = useMemo(()=>crypto.randomUUID?.()||`${Date.now()}-${Math.random().toString(36).slice(2)}` ,[]);
+
+  async function handleFormSubmit(data: FormData){
+    const payload = { ...data, session_id: sessionId };
+    setFormData(payload); setPhase('summary');
+    try{
+      const r = await fetch('/diagnostic', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      const j = await r.json();
+      setDiagnostico(j.diagnostico);
+    }catch(e){ console.error(e); alert('Erro ao gerar diagnóstico'); }
+  }
+
+  async function sendMentor(){
+    if(!inputMsg.trim() || questionCount>=15) return;
+    setLoading(true);
+    const userMsg={role:'user' as const, content: inputMsg};
+    setMentorMessages(prev=>[...prev,userMsg]);
+    setQuestionCount(c=>c+1); setInputMsg('');
+
+    try{
+      const resp = await fetch('/chat-mentor', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ history:[...mentorMessages,userMsg], context: formData, session_id: sessionId }) });
+      const ct = resp.headers.get('content-type')||'';
+      if(ct.includes('text/plain')){
+        let assistant='';
+        setMentorMessages(prev=>[...prev,{role:'mentor',content:''}]);
+        const reader = resp.body?.getReader(); const dec = new TextDecoder();
+        if(reader){
+          while(true){ const {done,value}=await reader.read(); if(done) break; assistant+=dec.decode(value); setMentorMessages(prev=>{const c=[...prev]; c[c.length-1]={role:'mentor',content:assistant}; return c;}); }
+        }
+      }else{ const j=await resp.json(); setMentorMessages(prev=>[...prev,{role:'mentor',content:j.answer||''}]); }
+    }catch(e){ console.error(e); setMentorMessages(prev=>[...prev,{role:'mentor',content:'Erro ao conectar ao mentor.'}]); }
+    finally{ setLoading(false); }
+  }
+
+  return (
+    <div style={{minHeight:'100vh',background:'linear-gradient(135deg,#3b1d66,#1c2a7a)',color:'#fff',display:'flex',flexDirection:'column',alignItems:'center',padding:16}}>
+      {phase==='landing' && (
+        <div style={{textAlign:'center',maxWidth:720}}>
+          <h1 style={{fontSize:48,fontWeight:900,margin:'16px 0'}}>SephiraWay</h1>
+          <p style={{fontSize:18,opacity:.9,marginBottom:24}}>Diagnóstico geral espiritualizado + mentor com respostas em tempo real.</p>
+          <button onClick={()=>setPhase('form')} style={{padding:'16px 24px',borderRadius:12,border:0,background:'#2dd4bf',color:'#111',fontWeight:800}}>Iniciar Jornada ✨</button>
+        </div>
+      )}
+
+      {phase==='form' && (
+        <Suspense fallback={<p>Carregando…</p>}>
+          <Questionnaire onSubmit={handleFormSubmit} />
+        </Suspense>
+      )}
+
+      {phase==='summary' && (
+        <div style={{width:'100%',maxWidth:900,background:'rgba(255,255,255,.12)',borderRadius:12,padding:16,marginTop:16}}>
+          <h2 style={{fontSize:28,fontWeight:700,marginBottom:12}}>Seu Diagnóstico Geral</h2>
+          <div style={{background:'rgba(255,255,255,.18)',borderRadius:8,padding:12}}>
+            <p style={{lineHeight:1.6}}>{diagnostico||'Processando…'}</p>
+          </div>
+          <div style={{display:'flex',gap:12,marginTop:16}}>
+            <button onClick={()=>setPhase('chat')} style={{padding:'12px 16px',border:0,borderRadius:10,background:'#2dd4bf',color:'#111',fontWeight:800}}>Abrir Chat com Mentor</button>
+          </div>
+        </div>
+      )}
+
+      {phase==='chat' && (
+        <div style={{width:'100%',maxWidth:900,background:'rgba(255,255,255,.12)',borderRadius:12,padding:16,marginTop:16,display:'flex',flexDirection:'column',height:'75vh'}}>
+          <h2 style={{fontSize:28,fontWeight:700,marginBottom:12}}>Chat com Mentor</h2>
+          <div style={{flex:1,overflow:'auto',display:'grid',gap:8,marginBottom:12}}>
+            {mentorMessages.map((m,i)=> (
+              <div key={i} style={{textAlign: m.role==='user'?'right':'left'}}>
+                <span style={{fontWeight: m.role==='mentor'?700:400}}>{m.content}</span>
+              </div>
+            ))}
+          </div>
+          {questionCount<15 ? (
+            <div style={{display:'flex',gap:8}}>
+              <textarea value={inputMsg} onChange={e=>setInputMsg(e.target.value)} placeholder="Escreva sua pergunta…" style={{flex:1,padding:10,borderRadius:8,border:'1px solid #ddd',color:'#111'}}/>
+              <button onClick={sendMentor} disabled={loading} style={{padding:'12px 16px',borderRadius:10,border:0,background:'#2dd4bf',color:'#111',fontWeight:800}}>{loading?'Enviando…':'Enviar'}</button>
+            </div>
+          ) : (
+            <div style={{textAlign:'center'}}>
+              <p style={{marginBottom:8}}>Você atingiu o limite de 15 perguntas.</p>
+              <button onClick={()=>alert('Consulta Profunda (R$ 50,00)')} style={{padding:'12px 16px',borderRadius:10,border:0,background:'#facc15',color:'#111',fontWeight:800}}>Consulta Profunda (R$ 50,00)</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// functions/diagnostic.ts
+export const onRequest: PagesFunction<{ DB: D1Database, OPENAI_API_KEY: string }> = async (ctx) => {
+  try{
+    const body = await ctx.request.json();
+    const { nome_completo, data_nasc, hora_nasc, local_nasc, ennea_raw, intencao_12m } = body;
+    let { session_id } = body as any;
+    if(!session_id){ session_id = crypto.randomUUID(); }
+
+    // Upsert sessão
+    await ctx.env.DB.prepare('INSERT OR IGNORE INTO chat_sessions (id) VALUES (?)').bind(session_id).run();
+
+    // Carrega diretrizes
+    const rules = await ctx.env.DB.prepare('SELECT conteudo FROM t_guidelines ORDER BY prioridade ASC').all<{conteudo:string}>();
+    const system = `Você é um guia espiritual. Use APENAS estas diretrizes:\n\n${(rules.results||[]).map(r=>r.conteudo).join('\n\n')}\n\nDevolva um texto único (200–250 palavras), tom pessoal e espiritualizado.`;
+    const user = `Dados do usuário:\nNome: ${nome_completo}\nNascimento: ${data_nasc} ${hora_nasc}\nLocal: ${local_nasc}\nEneagrama: ${ennea_raw}\nIntenção: ${intencao_12m}`;
+
+    const oai = await fetch('https://api.openai.com/v1/chat/completions',{
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${ctx.env.OPENAI_API_KEY}`},
+      body: JSON.stringify({ model:'gpt-4o-mini', temperature:0.7, max_tokens:650, messages:[{role:'system',content:system},{role:'user',content:user}] })
+    });
+    if(!oai.ok){ const t = await oai.text(); throw new Error(`OpenAI ${oai.status}: ${t}`); }
+    const data = await oai.json();
+    const text = data.choices?.[0]?.message?.content || '';
+
+    // Salva diagnóstico como primeira msg do mentor
+    await ctx.env.DB.prepare('INSERT INTO chat_messages (session_id, role, content) VALUES (?,?,?)').bind(session_id,'assistant',text).run();
+
+    return new Response(JSON.stringify({ diagnostico: text, session_id }),{ headers:{'Content-Type':'application/json'} });
+  }catch(e){ console.error(e); return new Response('Internal Error',{status:500}); }
+};
+
+// functions/chat-mentor.ts
+export const onRequest: PagesFunction<{ DB: D1Database, OPENAI_API_KEY: string }> = async (ctx) => {
+  try{
+    const body = await ctx.request.json();
+    const { history=[], context={}, session_id } = body as any;
+    if(!session_id) return new Response('Bad Request', {status:400});
+
+    // Upsert sessão e salvar última pergunta do usuário
+    await ctx.env.DB.prepare('INSERT OR IGNORE INTO chat_sessions (id) VALUES (?)').bind(session_id).run();
+    const lastUser = history[history.length-1];
+    if(lastUser?.role==='user'){
+      await ctx.env.DB.prepare('INSERT INTO chat_messages (session_id, role, content) VALUES (?,?,?)').bind(session_id,'user',lastUser.content).run();
+    }
+
+    // Diretrizes
+    const rules = await ctx.env.DB.prepare('SELECT conteudo FROM t_guidelines ORDER BY prioridade ASC').all<{conteudo:string}>();
+    const system = `Você é um mentor compassivo. Siga APENAS estas diretrizes:\n${(rules.results||[]).map(r=>r.conteudo).join('\n\n')}\nResponda com 200–250 palavras e finalize com 1 ação prática.`;
+
+    const msgs:any[] = [ {role:'system',content:system}, {role:'user',content:`Contexto base: ${JSON.stringify(context)}`} ];
+    for(const m of history){ msgs.push({ role: m.role==='mentor'?'assistant':'user', content: m.content }); }
+
+    // Chamada com streaming
+    const oai = await fetch('https://api.openai.com/v1/chat/completions',{
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${ctx.env.OPENAI_API_KEY}`},
+      body: JSON.stringify({ model:'gpt-4o-mini', temperature:0.7, max_tokens:750, stream:true, messages: msgs })
+    });
+    if(!oai.ok){ const t=await oai.text(); throw new Error(`OpenAI ${oai.status}: ${t}`); }
+
+    const reader = oai.body!.getReader();
+    const dec = new TextDecoder();
+    const enc = new TextEncoder();
+    let assistant = '';
+
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller){
+        try{
+          while(true){
+            const {done,value} = await reader.read();
+            if(done) break;
+            const chunk = dec.decode(value, {stream:true});
+            const lines = chunk.split('\n');
+            for(const line of lines){
+              const s = line.trim();
+              if(!s.startsWith('data:')) continue;
+              const data = s.slice(5).trim();
+              if(data === '' || data === '[DONE]') continue;
+              try{
+                const j = JSON.parse(data);
+                const token = j.choices?.[0]?.delta?.content || '';
+                if(token){ assistant += token; controller.enqueue(enc.encode(token)); }
+              }catch{ /* ignore parse */ }
+            }
+          }
+          // salvar resposta completa
+          if(assistant.trim()){
+            await ctx.env.DB.prepare('INSERT INTO chat_messages (session_id, role, content) VALUES (?,?,?)').bind(session_id,'assistant',assistant).run();
+          }
+          controller.close();
+        }catch(err){ console.error(err); controller.error(err); }
+      }
+    });
+
+    return new Response(stream, { headers: { 'Content-Type':'text/plain; charset=utf-8', 'Cache-Control':'no-cache' } });
+  }catch(e){ console.error(e); return new Response('Internal Error', {status:500}); }
+};
+
+// schema.sql
+-- D1 schema (rodar com: npx wrangler d1 execute sephiraway-db --file=./schema.sql)
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  id TEXT PRIMARY KEY,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('system','user','assistant')),
+  content TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS t_guidelines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  area TEXT NOT NULL,
+  prioridade INTEGER NOT NULL,
+  conteudo TEXT NOT NULL
+);
+
+DELETE FROM t_guidelines;
+
+INSERT INTO t_guidelines (area, prioridade, conteudo) VALUES
+('numerologia',10,'Numerologia Pitagórica: Life Path pela soma da data até 1–9 (mantenha 11/22); Talentos 1–9 e mestres 11/22; palavras‑chave, qualidades e desafios. Referências: Balliett (1917), Juno Jordan (1965), Javane & Bunker (1979), Hans Decoz (1985).'),
+('astrologia',10,'Astrologia tropical clássica (pré‑1990): signos, elementos, modalidades, regentes; casas (Placidus); aspectos principais. Refer.: Alan Leo (1910), Heindel (1918), Rudhyar (1936), Linda Goodman (1968).'),
+('cabala',20,'Árvore da Vida (10 sephirot, 22 caminhos), correspondências herméticas; uso de gematria para intenção e nome. Refer.: Sefer Yetzirah, Golden Dawn (Mathers), Crowley.'),
+('tarot',20,'Tarot Rider‑Waite‑Smith (1910): 22 Maiores, 56 Menores; arquétipos e leituras objetivas. Refer.: RWS 1910.'),
+('i_ching',20,'I Ching: 64 hexagramas, Julgamento e Imagem; sorteio por moedas/varetas. Refer.: Wilhelm‑Baynes (1950).'),
+('runas',20,'Elder Futhark (24 runas): grafia, som, palavra‑chave; versos tradicionais. Refer.: Blum (1982).'),
+('enneagrama',20,'Enneagrama (9 tipos): paixões, virtudes, asas, integrações. Refer.: Gurdjieff, Ichazo, Riso‑Hudson.'),
+('quiromancia',30,'Linhas (Vida, Coração, Cabeça, Destino) e montes planetários. Refer.: Cheiro (1894).'),
+('biorritmos',30,'Ciclos físico (23d), emocional (28d), intelectual (33d); funções senoidais. Refer.: Swoboda & Fliess (1970s).'),
+('instagram',40,'@carolgraber.numerologia — numerologia prática (talentos, horas iguais, propósito).');
+
+// functions/test-schema.ts
+// Endpoint de verificação rápida: conta guidelines e retorna as 3 primeiras áreas
+export const onRequest: PagesFunction<{ DB: D1Database }> = async (ctx) => {
+  try {
+    const count = await ctx.env.DB.prepare('SELECT COUNT(*) as n FROM t_guidelines').first<{ n: number }>();
+    const rows = await ctx.env.DB.prepare('SELECT area FROM t_guidelines ORDER BY prioridade ASC, id ASC LIMIT 3').all<{ area: string }>();
+    return new Response(JSON.stringify({ ok: true, total: count?.n ?? 0, preview: rows.results?.map(r => r.area) ?? [] }), { headers: { 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+};
+
+// README.md
+# SephiraWay — Cloudflare Pages + Functions + D1 (FREE)
+
+Este repositório está pronto para deploy **100% gratuito** no Cloudflare Pages com Functions (Workers) e D1.
+
+## Estrutura
+- **Vite + React** (frontend estático → `dist`)
+- **Pages Functions** em `functions/`:
+  - `/diagnostic` → gera diagnóstico (200–250 palavras) e salva no D1
+  - `/chat-mentor` → chat com **streaming** + grava histórico no D1
+  - `/test-schema` → checagem rápida das seeds
+- **D1**: `schema.sql` (tabelas + seeds de diretrizes)
+
+## Passo a passo (produção – Cloudflare Pages)
+1. **Conecte seu repositório** no Pages.
+2. **Build settings** → *muito importante*:
+   - Build command: `npm run build`
+   - Output directory: `dist`
+3. **Functions → D1 Databases**: adicione um binding chamado **DB**, apontando para seu banco `sephiraway-db` (criado via Wrangler).
+4. **Environment Variables**: adicione `OPENAI_API_KEY`.
+5. **Deploy**.
+6. Teste: acesse `/test-schema` para ver `{ ok: true, total: 10 }`.
+
+## Passo a passo (local – dev)
+```bash
+npm i
+npx wrangler d1 create sephiraway-db
+# copie o database_id para wrangler.toml
+npx wrangler d1 execute sephiraway-db --file=./schema.sql
+# inicie dev com DB e variável de ambiente
+npx wrangler pages dev --d1=DB --binding OPENAI_API_KEY=sk-...
+```
+Abra `http://localhost:8788`.
+
+## Troubleshooting
+- **"vite: not found"**: No Pages, configure **Build command = npm run build** (não "vite build").
+- **"No wrangler.toml file found"**: não é obrigatório para Pages em produção, mas facilite o dev local mantendo este arquivo versionado (já incluído aqui).
+- **OpenAI 401/403**: verifique `OPENAI_API_KEY` nas variáveis do projeto (produção) e `--binding` no dev.
+- **DB não encontrado nas Functions**: confira que o binding se chama **DB** e aponta para o D1 correto.
+
+## Expectativa de comportamento
+- `/diagnostic` retorna JSON `{ diagnostico, session_id }` e grava a primeira mensagem do `assistant`.
+- `/chat-mentor` responde em `text/plain` **streaming** (tokens parciais) e, ao final, grava a resposta inteira.
+- Histórico fica em `chat_sessions` e `chat_messages`.
+
+Se quiser, peça que eu adicione uma rota `/history/:session_id` para listar mensagens — deixei o schema pronto para isso.
+
